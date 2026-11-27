@@ -4,8 +4,9 @@ import csv
 import json
 import logging
 import os
+import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from .config import settings
 
@@ -75,36 +76,100 @@ def _parse(ts: str) -> datetime:
     return datetime.fromisoformat(ts.replace("Z", "+00:00"))
 
 
+def _is_delegation_error(e: Exception) -> bool:
+    """True when Google refused because domain-wide delegation isn't set up (so shared-calendar mode is the way)."""
+    t = f"{type(e).__name__} {e}".lower()
+    return any(k in t for k in ("unauthorized_client", "refresherror", "invalid_grant", "forbiddenforserviceaccounts",
+                                "not authorized to access this resource"))
+
+
+def service_account_email() -> str:
+    try:
+        info = json.loads(settings.google_sa_json) if settings.google_sa_json else json.load(open(settings.google_sa_file))
+        return info.get("client_email", "")
+    except Exception:
+        return ""
+
+
+def meeting_link_for(email: str) -> str:
+    return dict((k.strip().lower(), v.strip()) for k, v in settings.meeting_links).get(email.lower()) or settings.default_meeting_link
+
+
 class GoogleCalendar:
-    def _svc(self, email):
+    """Two ways to reach a presenter's calendar, chosen per presenter (GOOGLE_MODE=auto):
+    delegated: the app acts as the presenter (needs a Workspace admin once). Meet links and invites work.
+    shared:    the presenter shared their calendar with the service account (no admin). Free/busy and events work;
+               Google doesn't allow invites or auto Meet links here, so a fixed meeting link is used instead."""
+
+    def __init__(self):
+        self._modes = {}      # email -> (mode, checked_at)
+
+    def _service(self, email, delegated):
         from googleapiclient.discovery import build
-        return build("calendar", "v3", credentials=_creds(CAL_SCOPES, email), cache_discovery=False)
+        return build("calendar", "v3", credentials=_creds(CAL_SCOPES, email if delegated else None), cache_discovery=False)
+
+    def mode(self, email) -> str:
+        if settings.google_mode in ("delegated", "shared"):
+            return settings.google_mode
+        hit = self._modes.get(email)
+        if hit and time.time() - hit[1] < (600 if hit[0] == "delegated" else 300):   # re-check shared often, so a later admin approval is noticed
+            return hit[0]
+        now = datetime.now(timezone.utc)
+        try:
+            self._service(email, True).freebusy().query(body={"timeMin": now.isoformat(), "timeMax": (now + timedelta(minutes=1)).isoformat(),
+                                                              "items": [{"id": "primary"}]}).execute()
+            mode = "delegated"
+        except Exception as e:
+            if not _is_delegation_error(e):
+                raise
+            mode = "shared"
+        self._modes[email] = (mode, time.time())
+        return mode
 
     def busy(self, email, start, end):
-        body = {"timeMin": start.isoformat(), "timeMax": end.isoformat(), "items": [{"id": "primary"}]}
-        cal = self._svc(email).freebusy().query(body=body).execute()["calendars"]["primary"]
+        mode = self.mode(email)
+        cal_id = "primary" if mode == "delegated" else email
+        body = {"timeMin": start.isoformat(), "timeMax": end.isoformat(), "items": [{"id": cal_id}]}
+        cal = self._service(email, mode == "delegated").freebusy().query(body=body).execute()["calendars"][cal_id]
         if cal.get("errors"):
-            raise RuntimeError(f"freebusy error for {email}: {cal['errors']}")
+            raise RuntimeError(f"cannot read {email}'s calendar ({mode} mode): {cal['errors']}")
         return [(_parse(b["start"]), _parse(b["end"])) for b in cal.get("busy", [])]
 
     def create_event(self, email, *, summary, description, start, end, tz, attendee):
-        body = {
-            "summary": summary, "description": description,
-            "start": {"dateTime": start.isoformat(), "timeZone": tz},
-            "end": {"dateTime": end.isoformat(), "timeZone": tz},
-            **({"attendees": [{"email": attendee}]} if attendee else {}),
-            "conferenceData": {"createRequest": {"requestId": uuid.uuid4().hex,
-                                                 "conferenceSolutionKey": {"type": "hangoutsMeet"}}},
-            "extendedProperties": {"private": {"source": "demo-agent"}},
-        }
-        ev = self._svc(email).events().insert(calendarId="primary", body=body, conferenceDataVersion=1,
-                                              sendUpdates="all").execute()
-        meet = ev.get("hangoutLink") or next(
-            (p["uri"] for p in ev.get("conferenceData", {}).get("entryPoints", []) if p.get("entryPointType") == "video"), None)
+        delegated = self.mode(email) == "delegated"
+        body = {"summary": summary, "description": description, "start": {"dateTime": start.isoformat(), "timeZone": tz},
+                "end": {"dateTime": end.isoformat(), "timeZone": tz}, "extendedProperties": {"private": {"source": "demo-agent"}}}
+        link = None
+        if delegated:
+            if attendee:
+                body["attendees"] = [{"email": attendee}]
+            body["conferenceData"] = {"createRequest": {"requestId": uuid.uuid4().hex, "conferenceSolutionKey": {"type": "hangoutsMeet"}}}
+        else:
+            link = meeting_link_for(email)
+            extra = ([f"Join: {link}"] if link else []) + ([f"Prospect email: {attendee}"] if attendee else [])
+            body["description"] = "\n".join([description] + extra)
+            if link:
+                body["location"] = link
+        ev = self._service(email, delegated).events().insert(
+            calendarId="primary" if delegated else email, body=body, conferenceDataVersion=1 if delegated else 0,
+            sendUpdates="all" if delegated else "none").execute()
+        meet = (ev.get("hangoutLink") or next((p["uri"] for p in ev.get("conferenceData", {}).get("entryPoints", [])
+                                               if p.get("entryPointType") == "video"), None)) if delegated else link
         return {"event_id": ev["id"], "meet_link": meet, "html_link": ev.get("htmlLink")}
 
     def delete_event(self, email, event_id):
-        self._svc(email).events().delete(calendarId="primary", eventId=event_id, sendUpdates="all").execute()
+        delegated = self.mode(email) == "delegated"
+        self._service(email, delegated).events().delete(calendarId="primary" if delegated else email, eventId=event_id,
+                                                        sendUpdates="all" if delegated else "none").execute()
+
+    def diagnose(self, email) -> dict:
+        now = datetime.now(timezone.utc)
+        try:
+            mode = self.mode(email)
+            self.busy(email, now, now + timedelta(hours=1))
+            return {"email": email, "mode": mode, "ok": True, "detail": "", "link": bool(meeting_link_for(email))}
+        except Exception as e:
+            return {"email": email, "mode": "?", "ok": False, "detail": f"{type(e).__name__}: {str(e)[:180]}", "link": bool(meeting_link_for(email))}
 
 
 class GoogleSheets:
@@ -117,6 +182,17 @@ class GoogleSheets:
         svc.spreadsheets().values().append(
             spreadsheetId=settings.sheet_id, range=f"{settings.sheet_tab}!A1", valueInputOption="RAW",
             insertDataOption="INSERT_ROWS", body={"values": [row]}).execute()
+
+
+def check_sheet() -> str:
+    """'' if the sheet is reachable, otherwise a plain-English problem."""
+    from googleapiclient.discovery import build
+    try:
+        build("sheets", "v4", credentials=_creds(SHEETS_SCOPES), cache_discovery=False).spreadsheets().get(
+            spreadsheetId=settings.sheet_id, fields="properties.title").execute()
+        return ""
+    except Exception as e:
+        return f"{type(e).__name__}: {str(e)[:160]}"
 
 
 # ----------------------------------------------------------------------------- access

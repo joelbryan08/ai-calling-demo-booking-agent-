@@ -94,3 +94,10 @@ Calls: voicemail detection, silence nudge then goodbye, Hindi/Hinglish (AGENT_LA
 
 ## Step 9
 Call summaries (AI summary, sentiment, pain points, next step, shown in the call window) and recordings (RECORD_CALLS=true; stereo WAV in RECORDINGS_DIR, played from the call window; the opening line adds RECORDING_NOTICE).
+
+## Step 10 - Google Calendar, both ways
+`python scripts/check_google.py` tells you, per presenter, which mode works and what to fix.
+- Shared (no admin): each presenter opens Google Calendar > Settings and sharing > Share with specific people, adds the
+  service account email (printed by the checker) with "Make changes to events". Set MEETING_LINKS or DEFAULT_MEETING_LINK.
+- Delegated (admin once): see the earlier admin steps; gives Meet links and invites.
+- GOOGLE_MODE=auto uses delegation where it works and shared calendars where it doesn't.

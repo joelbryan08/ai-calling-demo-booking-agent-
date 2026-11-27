@@ -49,6 +49,9 @@ class Settings:
     max_demos_per_day: int = int(os.getenv("MAX_DEMOS_PER_DAY", "3"))
     min_notice_hours: int = int(os.getenv("MIN_NOTICE_HOURS", "3"))
     max_lookahead_days: int = int(os.getenv("MAX_LOOKAHEAD_DAYS", "14"))
+    google_mode: str = os.getenv("GOOGLE_MODE", "auto").lower()          # auto | delegated | shared
+    meeting_links: tuple = tuple(p.split("=", 1) for p in os.getenv("MEETING_LINKS", "").split(";") if "=" in p)  # email=url;email=url
+    default_meeting_link: str = os.getenv("DEFAULT_MEETING_LINK", "")
     google_sa_file: str = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "")
     google_sa_json: str = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
     sheet_id: str = os.getenv("SHEET_ID", "")
